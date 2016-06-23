@@ -1,9 +1,21 @@
 #! /usr/bin/env python
 
+# --------------------------------------------------------------
+# alexaPi ported to Nascent
+# original by @sammachin: https://github.com/sammachin/AlexaPi
+# --------------------------------------------------------------
+# nascent-author: baback@nascentobjects.com
+#
+# Feature deltas from alexaPi:
+#   Ported to Nascent Main
+#   Added TuneIn support with mopidy-TuneIn extension
+#   Added pocketsphinx keyphrase detection
+#   Added webrtcVAD silence detection UX
+# --------------------------------------------------------------
+
 import os
 import random
 import time
-import RPi.GPIO as GPIO
 import alsaaudio
 import wave
 from creds import *
@@ -15,37 +27,19 @@ import vlc
 import threading
 import cgi 
 import email
-import optparse
+import getch
+import sys
+import fileinput
+import datetime
+
+import tunein
+import webrtcvad
 
 from pocketsphinx.pocketsphinx import *
 from sphinxbase.sphinxbase import *
 
 #Settings
-button = 18 		# GPIO Pin with button connected
-plb_light = 24		# GPIO Pin for the playback/activity light
-rec_light = 25		# GPIO Pin for the recording light
-lights = [plb_light, rec_light] 	# GPIO Pins with LED's connected
-device = "plughw:1" # Name of your microphone/sound card in arecord -L
-
-#Get arguments
-parser = optparse.OptionParser()
-parser.add_option('-s', '--silent',
-                dest="silent",
-                action="store_true",
-                default=False,
-                help="start without saying hello"
-                )
-parser.add_option('-d', '--debug',
-                dest="debug",
-                action="store_true",
-                default=False,
-                help="display debug messages"
-                )
-
-cmdopts, cmdargs = parser.parse_args()
-silent = cmdopts.silent
-debug = cmdopts.debug
-
+device = "plughw:2" # Name of your microphone/sound card in arecord -L
 
 #Setup
 recorded = False
@@ -56,7 +50,7 @@ path = os.path.realpath(__file__).rstrip(os.path.basename(__file__))
 #Sphinx setup
 trigger_phrase = "alexa"
 
-sphinx_data_path = "/root/pocketsphinx/"
+sphinx_data_path = "/home/root/pocketsphinx/"
 modeldir = sphinx_data_path+"/model/"
 datadir = sphinx_data_path+"/test/data"
 
@@ -69,7 +63,7 @@ config.set_string('-dict', os.path.join(modeldir, 'en-us/cmudict-en-us.dict'))
 
 #Specify recognition key phrase
 config.set_string('-keyphrase', trigger_phrase)
-config.set_float('-kws_threshold',3)
+config.set_float('-kws_threshold',1e-5) # low false-positive, good correct-positives seem to be in 1e-20 to +7 range
 
 # Hide the VERY verbose logging information
 config.set_string('-logfn', '/dev/null')
@@ -85,8 +79,23 @@ streamurl = ""
 streamid = ""
 position = 0
 audioplaying = False
-button_pressed = False
 start = time.time()
+tunein_parser = tunein.TuneIn(5000)
+vad = webrtcvad.Vad(2)
+currVolume = 100
+
+# constants 
+VAD_SAMPLERATE = 16000
+VAD_FRAME_MS = 30
+VAD_PERIOD = (VAD_SAMPLERATE / 1000) * VAD_FRAME_MS
+VAD_SILENCE_TIMEOUT = 1000
+VAD_THROWAWAY_FRAMES = 10
+MAX_RECORDING_LENGTH = 8 
+MAX_VOLUME = 100
+MIN_VOLUME = 30
+
+#Debug
+debug = 1
 
 class bcolors:
 	HEADER = '\033[95m'
@@ -126,7 +135,6 @@ def gettoken():
 def alexa_speech_recognizer():
 	# https://developer.amazon.com/public/solutions/alexa/alexa-voice-service/rest/speechrecognizer-requests
 	if debug: print("{}Sending Speech Request...{}".format(bcolors.OKBLUE, bcolors.ENDC))
-	GPIO.output(plb_light, GPIO.HIGH)
 	url = 'https://access-alexa-na.amazon.com/v1/avs/speechrecognizer/recognize'
 	headers = {'Authorization' : 'Bearer %s' % gettoken()}
 	d = {
@@ -163,7 +171,6 @@ def alexa_getnextitem(nav_token):
 	time.sleep(0.5)
         if audioplaying == False:
 		if debug: print("{}Sending GetNextItem Request...{}".format(bcolors.OKBLUE, bcolors.ENDC))
-		GPIO.output(plb_light, GPIO.HIGH)
 		url = 'https://access-alexa-na.amazon.com/v1/avs/audioplayer/getNextItem'
 		headers = {'Authorization' : 'Bearer %s' % gettoken(), 'content-type' : 'application/json; charset=UTF-8'}
 		d = {
@@ -220,7 +227,7 @@ def alexa_playback_progress_report_request(requestType, playerActivity, streamid
 		if debug: print("{}Playback Progress Report was {}Successful!{}".format(bcolors.OKBLUE, bcolors.OKGREEN, bcolors.ENDC))
 
 def process_response(r):
-	global nav_token, streamurl, streamid
+	global nav_token, streamurl, streamid, currVolume, isMute
 	if debug: print("{}Processing Request Response...{}".format(bcolors.OKBLUE, bcolors.ENDC))
 	nav_token = ""
 	streamurl = ""
@@ -241,12 +248,10 @@ def process_response(r):
 		# Now process the response
 		if 'directives' in j['messageBody']:
 			if len(j['messageBody']['directives']) == 0:
-				GPIO.output(rec_light, GPIO.LOW)
-				GPIO.output(plb_light, GPIO.LOW)
+				if debug: print("0 Directives received")
 			for directive in j['messageBody']['directives']:
 				if directive['namespace'] == 'SpeechSynthesizer':
 					if directive['name'] == 'speak':
-						GPIO.output(rec_light, GPIO.LOW)
 						play_audio(path + "tmpcontent/"+directive['payload']['audioContent'].lstrip("cid:")+".mp3")
 					elif directive['name'] == 'listen':
 						#listen for input - need to implement silence detection for this to be used.
@@ -265,6 +270,23 @@ def process_response(r):
 								content = stream['streamUrl']
 							pThread = threading.Thread(target=play_audio, args=(content, stream['offsetInMilliseconds']))
 							pThread.start()
+				elif directive['namespace'] == "Speaker":
+					# speaker control such as volume
+					if directive['name'] == 'SetVolume':
+						vol_token = directive['payload']['volume']
+						type_token = directive['payload']['adjustmentType']
+						if (type_token == 'relative'):
+							currVolume = currVolume + int(vol_token)
+						else:
+							currVolume = int(vol_token)
+
+						if (currVolume > MAX_VOLUME):
+							currVolume = MAX_VOLUME
+						elif (currVolume < MIN_VOLUME):
+							currVolume = MIN_VOLUME
+
+						if debug: print("new volume = {}".format(currVolume))
+
 		elif 'audioItem' in j['messageBody']: 			#Additional Audio Iten
 			nav_token = j['messageBody']['navigationToken']
 			for stream in j['messageBody']['audioItem']['streams']:
@@ -279,51 +301,45 @@ def process_response(r):
 			
 		return
 	elif r.status_code == 204:
-		GPIO.output(rec_light, GPIO.LOW)
-		for x in range(0, 3):
-			time.sleep(.2)
-			GPIO.output(plb_light, GPIO.HIGH)
-			time.sleep(.2)
-			GPIO.output(plb_light, GPIO.LOW)
 		if debug: print("{}Request Response is null {}(This is OKAY!){}".format(bcolors.OKBLUE, bcolors.OKGREEN, bcolors.ENDC))
 	else:
 		print("{}(process_response Error){} Status Code: {}".format(bcolors.WARNING, bcolors.ENDC, r.status_code))
 		r.connection.close()
-		GPIO.output(lights, GPIO.LOW)
-		for x in range(0, 3):
-			time.sleep(.2)
-			GPIO.output(rec_light, GPIO.HIGH)
-			time.sleep(.2)
-			GPIO.output(lights, GPIO.LOW)
 
-
-def tuneinplaylist(url):
-	req = requests.get(url)
-	r = requests.get(req.content)
-	for line in r.content.split('\n'):
-		if line.startswith('File'):
-			list = line.split("=")[1:]
-			nurl = "=".join(list)
-			return nurl
-
-def play_audio(file, offset=0):
-	if file.startswith('http://opml.radiotime.com'):
+def play_audio(file, offset=0, overRideVolume=0):
+	global currVolume
+	if (file.find('radiotime.com') != -1):
 		file = tuneinplaylist(file)
 	global nav_token, p, audioplaying
 	if debug: print("{}Play_Audio Request for:{} {}".format(bcolors.OKBLUE, bcolors.ENDC, file))
-	GPIO.output(plb_light, GPIO.HIGH)
-	i = vlc.Instance('--aout=alsa')
+	i = vlc.Instance('--aout=alsa', '--alsa-audio-device=mono', '--file-logging', '--logfile=vlc-log.txt')
 	m = i.media_new(file)
 	p = i.media_player_new()
 	p.set_media(m)
 	mm = m.event_manager()
 	mm.event_attach(vlc.EventType.MediaStateChanged, state_callback, p)
 	audioplaying = True
-	p.audio_set_volume(100)
+
+	if (overRideVolume == 0):
+		p.audio_set_volume(currVolume)
+	else:
+		p.audio_set_volume(overRideVolume)
+
 	p.play()
 	while audioplaying:
 		continue
-	GPIO.output(plb_light, GPIO.LOW)
+
+def tuneinplaylist(url):
+	global tunein_parser
+	if (debug): print("TUNE IN URL = {}".format(url))
+	req = requests.get(url)
+	lines = req.content.split('\n')
+	
+	nurl = tunein_parser.parse_stream_url(lines[0])
+	if (len(nurl) != 0):
+		return nurl[0]
+
+	return ""
 
 
 def state_callback(event, player):
@@ -372,41 +388,25 @@ def state_callback(event, player):
 		streamid = ""
 		nav_token = ""
 
-def detect_button(channel):
-        global button_pressed
-        buttonPress = time.time()
-        button_pressed = True
-        if debug: print("{}Button Pressed! Recording...{}".format(bcolors.OKBLUE, bcolors.ENDC))
-        time.sleep(.5) # time for the button input to settle down
-        while (GPIO.input(button)==0):
-                button_pressed = True
-                time.sleep(.1)
-                if time.time() - buttonPress > 10: # pressing button for 10 seconds triggers a system halt
-                	play_audio(path+'alexahalt.mp3')
-                	if debug: print("{} -- 10 second putton press.  Shutting down. -- {}".format(bcolors.WARNING, bcolors.ENDC))
-                	os.system("halt")
-        if debug: print("{}Recording Finished.{}".format(bcolors.OKBLUE, bcolors.ENDC))
-        button_pressed = False
-        time.sleep(.5) # more time for the button to settle down
-
 def start():
-	global audioplaying, p, button_pressed
-	audio = ""
-	record_audio = False
-	GPIO.add_event_detect(button, GPIO.FALLING, callback=detect_button, bouncetime=100) # threaded detection of button press
-	inp = alsaaudio.PCM(alsaaudio.PCM_CAPTURE, alsaaudio.PCM_NORMAL, device)
-        inp.setchannels(1)
-        inp.setrate(16000)
-        inp.setformat(alsaaudio.PCM_FORMAT_S16_LE)
-        inp.setperiodsize(1024)
-        start = time.time()
+	global audioplaying, p, vad
 	while True:
-                while button_pressed == False and record_audio == False:
+                record_audio = False;
+
+                # Enable reading microphone raw data
+                inp = alsaaudio.PCM(alsaaudio.PCM_CAPTURE, alsaaudio.PCM_NORMAL, device)
+                inp.setchannels(1)
+                inp.setrate(16000)
+                inp.setformat(alsaaudio.PCM_FORMAT_S16_LE)
+                inp.setperiodsize(1024)
+                audio = ""
+
+                while record_audio == False:
 
                         time.sleep(.1)
 
                         # Process microphone audio via PocketSphinx, listening for trigger word
-                        while decoder.hyp() == None and button_pressed == False:
+                        while decoder.hyp() == None:
                                 # Read from microphone
                                 l,buf = inp.read()
                                 # Detect if keyword/trigger word was said
@@ -414,82 +414,81 @@ def start():
 
                         # if trigger word was said
                         if decoder.hyp() != None:
-                                if audioplaying: p.stop()
-                                start = time.time()
-                                play_audio(path+'alexayes.mp3')
+                                p.stop()
                                 record_audio = True
-                # do the following things if either the button has been pressed or the trigger word has been said
+
+                # do the following things if the trigger word has been said
                 if debug: print ("detected the edge, setting up audio")
 
                 # To avoid overflows close the microphone connection
                 inp.close()
-
-                if audioplaying: p.stop()
+                play_audio(path+'alexayes.mp3', 0)
 
                 # Reenable reading microphone raw data
                 inp = alsaaudio.PCM(alsaaudio.PCM_CAPTURE, alsaaudio.PCM_NORMAL, device)
                 inp.setchannels(1)
-                inp.setrate(16000)
+                inp.setrate(VAD_SAMPLERATE)
                 inp.setformat(alsaaudio.PCM_FORMAT_S16_LE)
-                inp.setperiodsize(1024)
+                inp.setperiodsize(VAD_PERIOD)
                 audio = ""
 
+                # Buffer as long as we haven't heard enough silence or the total size is within max size
+                thresholdSilenceMet = False
+                frames = 0
+                numSilenceRuns = 0
+                silenceRun = 0
+                start = time.time()
 
-                # Only write if we are recording (button still pressed or less than 5 sec
-                while button_pressed == True or (time.time() - start < 5):
+                # do not count first 10 frames when doing VAD
+                while (frames < VAD_THROWAWAY_FRAMES):
+                	l, data = inp.read()
+                	frames = frames + 1
+	            	if l:
+	            		audio += data
+	            		isSpeech = vad.is_speech(data, VAD_SAMPLERATE)
+	
+				# now do VAD
+                while (thresholdSilenceMet == False) and ((time.time() - start) < MAX_RECORDING_LENGTH):
                         l, data = inp.read()
                         if l:
-                                audio += data
-                        GPIO.output(rec_light, GPIO.HIGH)
+                        	audio += data
+                
+                        	if (l == VAD_PERIOD):
+                        		isSpeech = vad.is_speech(data, VAD_SAMPLERATE)
+
+                    			if (isSpeech == False):
+                    				silenceRun = silenceRun + 1
+                        			#print "0"
+	                    		else:
+	                    			silenceRun = 0
+	                    			numSilenceRuns = numSilenceRuns + 1
+	                    			#print "1"
+
+                        # only count silence runs after the first one 
+                        # (allow user to speak for total of max recording length if they haven't said anything yet)
+                        if (numSilenceRuns != 0) and ((silenceRun * VAD_FRAME_MS) > VAD_SILENCE_TIMEOUT):
+                        	thresholdSilenceMet = True
 
                 if debug: print ("Debug: End recording")
-                GPIO.output(rec_light, GPIO.LOW)
+                play_audio(path+'beep.wav', 0, 100)
+
                 rf = open(path+'recording.wav', 'w')
                 rf.write(audio)
                 rf.close()
                 inp.close()
 
                 if debug: print "Debug: Sending audio to be processed"
-		alexa_speech_recognizer()
+                alexa_speech_recognizer()
 		
                 # Now that request is handled restart audio decoding
                 decoder.end_utt()
                 decoder.start_utt()
-                record_audio = False;
-
-                # Reenable reading microphone raw data
-                inp = alsaaudio.PCM(alsaaudio.PCM_CAPTURE, alsaaudio.PCM_NORMAL, device)
-                inp.setchannels(1)
-                inp.setrate(16000)
-                inp.setformat(alsaaudio.PCM_FORMAT_S16_LE)
-                inp.setperiodsize(1024)
-                audio = ""
-
 
 
 def setup():
-	GPIO.setwarnings(False)
-	GPIO.cleanup()
-	GPIO.setmode(GPIO.BCM)
-	GPIO.setup(button, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-	GPIO.setup(lights, GPIO.OUT)
-	GPIO.output(lights, GPIO.LOW)
 	while internet_on() == False:
 		print(".")
-	token = gettoken()
-	if token == False:
-		while True:
-			for x in range(0, 5):
-				time.sleep(.1)
-				GPIO.output(rec_light, GPIO.HIGH)
-				time.sleep(.1)
-				GPIO.output(rec_light, GPIO.LOW)
-	for x in range(0, 5):
-		time.sleep(.1)
-		GPIO.output(plb_light, GPIO.HIGH)
-		time.sleep(.1)
-		GPIO.output(plb_light, GPIO.LOW)
-	if (silent == False): play_audio(path+"hello.mp3")
+	play_audio(path+"hello.mp3", 0, 100)
 
 
 if __name__ == "__main__":
