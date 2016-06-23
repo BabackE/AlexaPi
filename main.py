@@ -4,7 +4,6 @@
 # alexaPi ported to Nascent
 # original by @sammachin: https://github.com/sammachin/AlexaPi
 # --------------------------------------------------------------
-# nascent-author: baback@nascentobjects.com
 #
 # Feature deltas from alexaPi:
 #   Ported to Nascent Main
@@ -63,7 +62,7 @@ config.set_string('-dict', os.path.join(modeldir, 'en-us/cmudict-en-us.dict'))
 
 #Specify recognition key phrase
 config.set_string('-keyphrase', trigger_phrase)
-config.set_float('-kws_threshold',1e-5) # low false-positive, good correct-positives seem to be in 1e-20 to +7 range
+config.set_float('-kws_threshold',1e-5) # low false-positive, good correct-positives tuned for DSP on Nascent Microphone module
 
 # Hide the VERY verbose logging information
 config.set_string('-logfn', '/dev/null')
